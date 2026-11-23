@@ -1,0 +1,351 @@
+"""
+WebSocket endpoints
+═══════════════════
+
+Endpoints
+─────────
+  WS /ws/admin/assignments
+      Admin dashboard — receives all assignment & booking events.
+      Requires JWT as query param: ?token=<access_token>
+
+  WS /ws/booking/{booking_id}
+      Track a single booking (admin, customer, or technician).
+      Requires ?token=<access_token>
+
+  WS /ws/technician/{technician_id}
+      Technician app — receives job offers + booking updates.
+      Requires ?token=<access_token>
+
+Auth
+────
+  WebSocket connections cannot send HTTP headers after the handshake,
+  so the JWT is passed as ?token= query parameter.
+
+  IMPORTANT: ws.accept() MUST be called before ws.close() — the HTTP→WS
+  upgrade handshake must complete before the server can send a WS close frame.
+  Without accept(), Starlette drops the TCP connection immediately, which
+  Firefox reports as NS_ERROR_WEBSOCKET_CONNECTION_REFUSED instead of a
+  clean close event.
+
+Client protocol (JSON text frames)
+───────────────────────────────────
+  Client → Server:
+    { "type": "PING" }
+    { "type": "SUBSCRIBE", "rooms": ["booking:abc", "admin:assignments"] }
+
+  Server → Client:
+    { "type": "PONG", "room": null, "payload": {}, "timestamp": "..." }
+    { "type": "CONNECTED", "room": null, "payload": { "rooms": [...], "connections": N } }
+    { "type": "BOOKING_STATUS_CHANGED", "room": "booking:abc", "payload": {...}, "timestamp": "..." }
+    ...etc
+"""
+
+import json
+import logging
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from jose import JWTError
+
+from app.core.security import decode_token
+from app.websocket.manager import (
+    manager,
+    WSEvent,
+    booking_room,
+    technician_room,
+    customer_room,
+    ADMIN_ASSIGNMENTS_ROOM,
+    ADMIN_BOOKINGS_ROOM,
+)
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+# ─── token validation helper ─────────────────────────────────────────────────
+async def _validate_ws_token(ws: WebSocket, token: str | None) -> dict | None:
+    """
+    Validates JWT from query param.
+    MUST call ws.accept() before ws.close() — otherwise Starlette drops
+    the TCP connection without completing the WebSocket handshake, which
+    causes Firefox to report NS_ERROR_WEBSOCKET_CONNECTION_REFUSED instead
+    of a clean close that the client can handle gracefully.
+    """
+    await ws.accept()  # ← complete the HTTP→WS upgrade FIRST
+
+    if not token:
+        await ws.close(code=4001, reason="Missing token")
+        return None
+    try:
+        payload = decode_token(token)
+        user_id = payload.get("sub")
+        role    = payload.get("role")
+        if not user_id:
+            await ws.close(code=4001, reason="Invalid token")
+            return None
+        return {"user_id": user_id, "role": role}
+    except JWTError:
+        await ws.close(code=4001, reason="Token expired or invalid")
+        return None
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _ws_loop(ws: WebSocket, rooms: list[str], user: dict):
+    """
+    Main message loop for any WS endpoint.
+    Handles PING → PONG and SUBSCRIBE to additional rooms.
+    Sends CONNECTED confirmation on startup.
+    """
+    try:
+        # Confirm connection
+        await ws.send_text(json.dumps({
+            "type":      "CONNECTED",
+            "room":      None,
+            "payload":   {
+                "rooms":       rooms,
+                "connections": manager.total_connections(),
+                "user_id":     user["user_id"],
+                "role":        user["role"],
+            },
+            "timestamp": _now_iso(),
+        }))
+
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            msg_type = msg.get("type", "")
+
+            if msg_type == WSEvent.PING:
+                await ws.send_text(json.dumps({
+                    "type": WSEvent.PONG, "room": None, "payload": {}, "timestamp": _now_iso()
+                }))
+
+            elif msg_type == "SUBSCRIBE":
+                # Allow client to subscribe to additional rooms at runtime
+                extra_rooms = msg.get("rooms", [])
+                if extra_rooms:
+                    await manager.connect(ws, extra_rooms)
+                    await ws.send_text(json.dumps({
+                        "type":      "SUBSCRIBED",
+                        "room":      None,
+                        "payload":   {"rooms": extra_rooms},
+                        "timestamp": _now_iso(),
+                    }))
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.warning(f"[WS] loop error for user={user['user_id']}: {e}")
+    finally:
+        await manager.disconnect(ws)
+
+
+# ─── Endpoints ───────────────────────────────────────────────────────────────
+
+@router.websocket("/ws/admin/assignments")
+async def ws_admin_assignments(
+    ws: WebSocket,
+    token: str | None = Query(default=None),
+):
+    """
+    Admin / CCO dashboard WebSocket.
+    Subscribes to:
+      - admin:assignments  (all assignment events)
+      - admin:bookings     (all booking status changes)
+    """
+    user = await _validate_ws_token(ws, token)
+    if not user:
+        return
+    if user["role"] not in ("SUPER_ADMIN", "ADMIN", "CCO"):
+        await ws.close(code=4003, reason="Forbidden")
+        return
+
+    rooms = [ADMIN_ASSIGNMENTS_ROOM, ADMIN_BOOKINGS_ROOM]
+    await manager.connect(ws, rooms)
+    logger.info(f"[WS] Admin connected user={user['user_id']} role={user['role']}")
+    await _ws_loop(ws, rooms, user)
+
+
+@router.websocket("/ws/booking/{booking_id}")
+async def ws_booking(
+    ws: WebSocket,
+    booking_id: str,
+    token: str | None = Query(default=None),
+):
+    """
+    Single-booking tracking stream.
+    Used by admin detail modal, customer app, or CCO to watch one booking in real time.
+    """
+    user = await _validate_ws_token(ws, token)
+    if not user:
+        return
+
+    rooms = [booking_room(booking_id), ADMIN_BOOKINGS_ROOM]
+    await manager.connect(ws, rooms)
+    logger.info(f"[WS] Booking {booking_id} tracked by user={user['user_id']}")
+    await _ws_loop(ws, rooms, user)
+
+
+@router.websocket("/ws/technician/{technician_id}")
+async def ws_technician(
+    ws: WebSocket,
+    technician_id: str,
+    token: str | None = Query(default=None),
+):
+    """
+    Technician-specific stream.
+    Receives: ASSIGNMENT_CREATED, ASSIGNMENT_AUTO_CANCELLED, booking updates.
+    """
+    user = await _validate_ws_token(ws, token)
+    if not user:
+        return
+
+    rooms = [technician_room(technician_id)]
+    await manager.connect(ws, rooms)
+    logger.info(f"[WS] Technician {technician_id} connected user={user['user_id']}")
+    await _ws_loop(ws, rooms, user)
+
+
+@router.websocket("/ws/customer/{user_id}")
+async def ws_customer(
+    ws: WebSocket,
+    user_id: str,
+    token: str | None = Query(default=None),
+):
+    """
+    Customer-specific real-time stream.
+    Receives: NOTIFICATION, BOOKING_STATUS_CHANGED, QUOTATION_UPDATED, QUOTATION_CREATED.
+    Requires ?token=<access_token> (same JWT used for HTTP requests).
+    """
+    user = await _validate_ws_token(ws, token)
+    if not user:
+        return
+
+    # Security: a customer can only subscribe to their own room.
+    # Admins/CCO may subscribe to any customer room for support purposes.
+    if user["role"] == "CUSTOMER" and user["user_id"] != user_id:
+        await ws.close(code=4003, reason="Forbidden")
+        return
+
+    rooms = [customer_room(user_id)]
+    await manager.connect(ws, rooms)
+    logger.info(f"[WS] Customer {user_id} connected user={user['user_id']}")
+    await _ws_loop(ws, rooms, user)
+
+
+# ─── Real-time backend log stream ────────────────────────────────────────────
+import asyncio
+import os
+
+LOG_FILE = os.environ.get(
+    "BACKEND_LOG_FILE",
+    "/home/srikanta/.pm2/logs/bibek-backend-out.log"
+)
+ERR_FILE = os.environ.get(
+    "BACKEND_ERR_FILE",
+    "/home/srikanta/.pm2/logs/bibek-backend-error.log"
+)
+LOG_TAIL_LINES = 100          # lines to send on initial connect
+
+
+@router.websocket("/ws/admin/logs")
+async def ws_admin_logs(
+    ws: WebSocket,
+    token: str | None = Query(default=None),
+):
+    """
+    Streams live backend stdout + stderr logs to the admin dashboard.
+    On connect: sends last LOG_TAIL_LINES from each log file (prefixed with [OUT] / [ERR]).
+    Then tails both files in real-time and forwards new lines as they appear.
+    Requires ?token=<access_token> with ADMIN or SUPER_ADMIN role.
+    """
+    user = await _validate_ws_token(ws, token)
+    if not user:
+        return
+
+    if user.get("role") not in ("ADMIN", "SUPER_ADMIN"):
+        await ws.close(code=4003, reason="Admin only")
+        return
+
+    async def _send(line: str):
+        try:
+            await ws.send_text(line)
+        except Exception:
+            pass
+
+    def _tail_file(path: str, n: int) -> list[str]:
+        """Read last n lines from a file without loading the whole file."""
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                buf, block = b"", 4096
+                lines_found = 0
+                pos = size
+                while pos > 0 and lines_found < n + 1:
+                    read = min(block, pos)
+                    pos -= read
+                    f.seek(pos)
+                    chunk = f.read(read)
+                    buf = chunk + buf
+                    lines_found = buf.count(b"\n")
+                lines = buf.decode("utf-8", errors="replace").splitlines()
+                return lines[-n:] if len(lines) >= n else lines
+        except FileNotFoundError:
+            return [f"[LOG FILE NOT FOUND: {path}]"]
+        except Exception as e:
+            return [f"[LOG READ ERROR: {e}]"]
+
+    # Send last N lines from both files on connect
+    for line in _tail_file(LOG_FILE, LOG_TAIL_LINES):
+        await _send(f"[OUT] {line}")
+    for line in _tail_file(ERR_FILE, LOG_TAIL_LINES):
+        await _send(f"[ERR] {line}")
+    await _send("[LOG_STREAM_READY]")
+
+    # Tail both files in real-time
+    async def _file_tailer(path: str, prefix: str):
+        try:
+            with open(path, "r", errors="replace") as f:
+                f.seek(0, 2)  # seek to end
+                while True:
+                    line = f.readline()
+                    if line:
+                        await _send(f"{prefix} {line.rstrip()}")
+                    else:
+                        await asyncio.sleep(0.3)
+        except FileNotFoundError:
+            await _send(f"{prefix} [FILE NOT FOUND: {path}]")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            await _send(f"{prefix} [TAILER ERROR: {e}]")
+
+    out_task = asyncio.create_task(_file_tailer(LOG_FILE, "[OUT]"))
+    err_task = asyncio.create_task(_file_tailer(ERR_FILE, "[ERR]"))
+
+    try:
+        # Keep alive: wait for disconnect or PING from client
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=30)
+                if msg == "PING":
+                    await _send("PONG")
+            except asyncio.TimeoutError:
+                await _send("PONG")  # heartbeat
+            except Exception:
+                break
+    finally:
+        out_task.cancel()
+        err_task.cancel()
+        try:
+            await ws.close()
+        except Exception:
+            pass
